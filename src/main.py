@@ -31,6 +31,7 @@ from .pi_integration.pi_adapter import PiAdapter
 from .tools.browser_tool import BrowserTool
 from .tools.huggingface_loader import HuggingFaceLoader
 from .tools.mcp_client import MCPClient
+from .core.gpu_monitor import GPUMonitor
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -96,6 +97,7 @@ class AssBrainOrchestrator:
         self.pi_adapter = PiAdapter(self.config, self.llm, self.memory, self.trainer)
 
         self._episodes_completed = 0
+        self.gpu_monitor = GPUMonitor(interval=2.0)
         console.print("[green]✓[/green] All components loaded.")
 
     # ------------------------------------------------------------------
@@ -141,12 +143,18 @@ class AssBrainOrchestrator:
 
     async def run_curriculum(self, max_episodes: int = 10) -> List[Dict[str, Any]]:
         """Run through curriculum episodes."""
+        self.gpu_monitor.start()
         results = []
-        for i in range(max_episodes):
-            result = await self.run_episode()
-            results.append(result)
-            if result.get("status") == "complete":
-                break
+        try:
+            for i in range(max_episodes):
+                result = await self.run_episode()
+                results.append(result)
+                if result.get("status") == "complete":
+                    break
+        finally:
+            self.gpu_monitor.stop()
+            console.print()  # newline after monitor
+            self.gpu_monitor.print_summary()
         return results
 
     async def generate_for_task(self, description: str, task_type: str = "code_generation") -> Dict[str, Any]:

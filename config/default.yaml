@@ -12,19 +12,31 @@ app:
 
 # LLM Engine Settings
 llm:
-  model_id: "microsoft/DialoGPT-medium"  # default local-friendly model
-  device: "auto"  # auto | cpu | cuda | mps
-  load_in_8bit: false
-  load_in_4bit: false
+  mode: "scratch"          # "scratch" = custom model from scratch | "pretrained" = load from HF
+  device: "auto"           # auto | cpu | cuda | mps
+  compile: true            # torch.compile() for speed (PyTorch 2.0+)
+
+  # ---- Scratch Model Architecture ----
+  vocab_size: 32000
+  block_size: 4096
+  n_layer: 24
+  n_head: 16
+  n_embd: 1024
+  dropout: 0.0
+  ffn_mult: 4.0
+  multiple_of: 256
+  tie_weights: true
+
+  # ---- Generation ----
   max_new_tokens: 2048
   temperature: 0.7
   top_p: 0.9
   top_k: 50
   repetition_penalty: 1.1
   context_window: 4096
-  batch_size: 1
+  batch_size: 4
 
-  # Fine-tuning / RL settings
+  # ---- Fine-tuning / RL (pretrained mode only) ----
   lora:
     r: 16
     lora_alpha: 32
@@ -33,14 +45,14 @@ llm:
     bias: "none"
     task_type: "CAUSAL_LM"
 
-  # Training hyperparameters for self-RL
+  # ---- Training Hyperparameters ----
   training:
-    learning_rate: 2.0e-4
-    per_device_train_batch_size: 1
+    learning_rate: 1.0e-4
+    per_device_train_batch_size: 4
     gradient_accumulation_steps: 4
     num_train_epochs: 1
-    max_steps: 100
-    warmup_steps: 10
+    max_steps: 200
+    warmup_steps: 20
     logging_steps: 5
     save_steps: 50
     output_dir: "./models/checkpoints"

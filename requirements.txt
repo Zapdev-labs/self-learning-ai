@@ -1,8 +1,14 @@
 # ASSBRAIN — Self-Learning AI Core Dependencies
-# Install with: pip install -r requirements.txt
+# DO NOT install manually with `pip install -r requirements.txt`.
+# Use the Python installer instead so GPU packages are handled correctly:
+#     python install.py
+#
+# The installer auto-detects NVIDIA GPU and installs CUDA-enabled PyTorch.
 
 # Core ML / LLM
-torch>=2.1.0
+# (torch is installed by install.py with the correct CUDA/CPU index URL)
+# torch>=2.1.0
+tokenizers>=0.15.0
 transformers>=4.38.0
 accelerate>=0.27.0
 peft>=0.8.0
@@ -14,7 +20,8 @@ bitsandbytes>=0.42.0
 # Vector Memory / RAG
 chromadb>=0.4.22
 sentence-transformers>=2.3.0
-faiss-cpu>=1.7.4
+# (faiss is installed by install.py: faiss-gpu-cu12 on GPU, faiss-cpu otherwise)
+# faiss-cpu>=1.7.4
 
 # Code Execution & Sandboxing
 docker>=7.0.0
@@ -56,6 +63,9 @@ pandas>=2.2.0
 
 # Next.js / Frontend scaffolding validation
 nodeenv>=1.8.0
+
+# GPU monitoring
+pynvml>=11.5.0
 
 # Optional: vLLM for fast local inference
 # vllm>=0.3.0; sys_platform == "linux"

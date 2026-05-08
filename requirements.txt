@@ -1,0 +1,61 @@
+# ASSBRAIN — Self-Learning AI Core Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core ML / LLM
+torch>=2.1.0
+transformers>=4.38.0
+accelerate>=0.27.0
+peft>=0.8.0
+datasets>=2.16.0
+huggingface-hub>=0.20.0
+sentencepiece>=0.1.99
+bitsandbytes>=0.42.0
+
+# Vector Memory / RAG
+chromadb>=0.4.22
+sentence-transformers>=2.3.0
+faiss-cpu>=1.7.4
+
+# Code Execution & Sandboxing
+docker>=7.0.0
+subprocess-tee>=0.4.1
+psutil>=5.9.8
+
+# Browser Automation
+playwright>=1.41.0
+
+# Web Server / API
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+
+# LSP / MCP
+python-lsp-jsonrpc>=1.1.2
+pylspclient>=0.0.2
+
+# Code Analysis
+pylint>=3.0.3
+black>=24.1.1
+mypy>=1.8.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.4
+coverage>=7.4.1
+ruff>=0.2.1
+
+# Data / Config / Utils
+pyyaml>=6.0.1
+python-dotenv>=1.0.1
+pydantic>=2.6.0
+rich>=13.7.0
+typer>=0.9.0
+jinja2>=3.1.3
+aiofiles>=23.2.1
+httpx>=0.26.0
+numpy>=1.26.3
+pandas>=2.2.0
+
+# Next.js / Frontend scaffolding validation
+nodeenv>=1.8.0
+
+# Optional: vLLM for fast local inference
+# vllm>=0.3.0; sys_platform == "linux"

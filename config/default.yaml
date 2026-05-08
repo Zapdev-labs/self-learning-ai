@@ -1,0 +1,117 @@
+# ASSBRAIN — Default Configuration
+app:
+  name: "ASSBRAIN"
+  version: "0.1.0"
+  mode: "development"  # development | production
+  log_level: "INFO"
+  data_dir: "./data"
+  memory_dir: "./memory"
+  models_dir: "./models"
+  projects_dir: "./projects"
+  logs_dir: "./logs"
+
+# LLM Engine Settings
+llm:
+  model_id: "microsoft/DialoGPT-medium"  # default local-friendly model
+  device: "auto"  # auto | cpu | cuda | mps
+  load_in_8bit: false
+  load_in_4bit: false
+  max_new_tokens: 2048
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 50
+  repetition_penalty: 1.1
+  context_window: 4096
+  batch_size: 1
+
+  # Fine-tuning / RL settings
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+    lora_dropout: 0.05
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+  # Training hyperparameters for self-RL
+  training:
+    learning_rate: 2.0e-4
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 4
+    num_train_epochs: 1
+    max_steps: 100
+    warmup_steps: 10
+    logging_steps: 5
+    save_steps: 50
+    output_dir: "./models/checkpoints"
+
+# Self-Learning Loop
+learning:
+  max_attempts_per_task: 5
+  reward_threshold: 0.8  # min reward to consider "learned"
+  curriculum_enabled: true
+  self_critique_enabled: true
+  imitation_learning_enabled: true
+  error_analysis_depth: "deep"  # shallow | medium | deep
+  experience_buffer_size: 10000
+  training_frequency: 10  # train after N new experiences
+  explore_vs_exploit: 0.3  # epsilon for exploration
+
+# Memory / Vector Store
+memory:
+  backend: "chroma"  # chroma | faiss
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  collection_name: "assbrain_memory"
+  similarity_threshold: 0.75
+  max_context_memories: 5
+
+# Evaluation & Sandbox
+evaluation:
+  sandbox_type: "subprocess"  # subprocess | docker
+  timeout_seconds: 60
+  max_memory_mb: 512
+  allow_network: false
+  allowed_imports: ["numpy", "pandas", "torch", "sklearn", "matplotlib", "seaborn", "transformers", "datasets", "fastapi", "pydantic"]
+  blocked_imports: ["os.system", "subprocess.call", "eval", "exec", "compile", "open", "importlib"]
+  auto_install_deps: true
+
+# Browser / Web Testing
+browser:
+  headless: true
+  screenshot_on_fail: true
+  viewport_width: 1280
+  viewport_height: 720
+  default_timeout: 30000
+
+# LSP Integration
+lsp:
+  python_server: "pylsp"  # pylsp | jedi-language-server
+  typescript_server: "typescript-language-server"
+  startup_timeout: 10
+  diagnostics_enabled: true
+
+# MCP (Model Context Protocol)
+mcp:
+  servers: []
+  # Example:
+  # - name: "filesystem"
+  #   command: "npx"
+  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "./projects"]
+
+# Code Generation
+generation:
+  supported_languages: ["python", "typescript", "javascript", "json", "yaml", "markdown", "html", "css"]
+  project_templates_dir: "./config/templates"
+  nextjs:
+    version: "14"
+    app_router: true
+    tailwind: true
+    shadcn: true
+    default_packages: ["next", "react", "react-dom", "typescript", "@types/node", "@types/react", "@types/react-dom", "tailwindcss", "postcss", "autoprefixer"]
+
+# Pi Integration
+pi:
+  enabled: true
+  adapter_port: 8765
+  model_alias: "assbrain-local"
+  streaming: true

@@ -1,4 +1,4 @@
-"""Train a custom BPE tokenizer for ASSBRAIN's scratch model."""
+"""Train a custom BPE tokenizer for ASSBRAIN's multimodal model."""
 
 import json
 import os
@@ -9,7 +9,16 @@ from tokenizers import Tokenizer, models, pre_tokenizers, trainers, processors
 
 
 class CodeTokenizer:
-    """Byte-Pair Encoding tokenizer trained on code."""
+    """Byte-Pair Encoding tokenizer trained on code with multimodal support."""
+
+    SPECIAL_TOKENS = [
+        "<pad>", "<unk>", "<s>", "</s>",
+        "<|im_start|>", "<|im_end|>",
+        "<|user|>", "<|assistant|>", "<|system|>",
+        "<|image_start|>", "<|image_end|>",
+        "<|tool_call_begin|>", "<|tool_call_end|>",
+        "<|tool_result_begin|>", "<|tool_result_end|>",
+    ]
 
     def __init__(self, vocab_size: int = 32000):
         self.vocab_size = vocab_size
@@ -24,14 +33,13 @@ class CodeTokenizer:
 
         trainer = trainers.BpeTrainer(
             vocab_size=self.vocab_size,
-            special_tokens=["<pad>", "<unk>", "<s>", "</s>", "<|im_start|>", "<|im_end|>", "<|user|>", "<|assistant|>", "<|system|>"],
+            special_tokens=self.SPECIAL_TOKENS,
             min_frequency=2,
             show_progress=True,
         )
 
         tokenizer.train(files, trainer)
 
-        # Post-processing template for chat
         tokenizer.post_processor = processors.TemplateProcessing(
             single="<s> $A </s>",
             pair="<s> $A </s> <s> $B </s>",
@@ -74,20 +82,51 @@ class CodeTokenizer:
     def vocab_size(self, value: int):
         self._vocab_size = value
 
+    def _get_id(self, token: str, default: int = 0) -> int:
+        if self._tok is None:
+            return default
+        try:
+            return self._tok.token_to_id(token)
+        except Exception:
+            return default
+
     @property
     def pad_token_id(self) -> int:
-        return self._tok.token_to_id("<pad>") if self._tok else 0
+        return self._get_id("<pad>", 0)
 
     @property
     def eos_token_id(self) -> int:
-        return self._tok.token_to_id("</s>") if self._tok else 2
+        return self._get_id("</s>", 2)
 
     @property
     def unk_token_id(self) -> int:
-        return self._tok.token_to_id("<unk>") if self._tok else 1
+        return self._get_id("<unk>", 1)
+
+    @property
+    def image_start_token_id(self) -> int:
+        return self._get_id("<|image_start|>", 32000)
+
+    @property
+    def image_end_token_id(self) -> int:
+        return self._get_id("<|image_end|>", 32001)
+
+    @property
+    def tool_call_begin_id(self) -> int:
+        return self._get_id("<|tool_call_begin|>", 32002)
+
+    @property
+    def tool_call_end_id(self) -> int:
+        return self._get_id("<|tool_call_end|>", 32003)
+
+    @property
+    def tool_result_begin_id(self) -> int:
+        return self._get_id("<|tool_result_begin|>", 32004)
+
+    @property
+    def tool_result_end_id(self) -> int:
+        return self._get_id("<|tool_result_end|>", 32005)
 
     def save_config(self, path: str):
-        """Save vocab mapping for inspection."""
         if self._tok is None:
             return
         vocab = self._tok.get_vocab()
@@ -96,7 +135,6 @@ class CodeTokenizer:
 
 
 def collect_code_files(root_dir: str, extensions: Optional[List[str]] = None) -> List[str]:
-    """Collect code files for tokenizer training."""
     if extensions is None:
         extensions = [".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml", ".md", ".html", ".css", ".rs", ".go", ".java", ".cpp", ".c", ".h"]
     files = []

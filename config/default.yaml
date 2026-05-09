@@ -1,8 +1,8 @@
-# ASSBRAIN — Default Configuration
+# ASSBRAIN — Default Configuration (9B Multimodal Scratch Model)
 app:
   name: "ASSBRAIN"
-  version: "0.1.0"
-  mode: "development"  # development | production
+  version: "0.2.0"
+  mode: "development"
   log_level: "INFO"
   data_dir: "./data"
   memory_dir: "./memory"
@@ -10,22 +10,31 @@ app:
   projects_dir: "./projects"
   logs_dir: "./logs"
 
-# LLM Engine Settings
+# LLM Engine Settings — 9B Multimodal Transformer from Scratch
 llm:
-  mode: "scratch"          # "scratch" = custom model from scratch | "pretrained" = load from HF
-  device: "auto"           # auto | cpu | cuda | mps
-  compile: true            # torch.compile() for speed (PyTorch 2.0+)
+  mode: "scratch"
+  device: "auto"
+  compile: true
+  use_tools: true
 
-  # ---- Scratch Model Architecture ----
+  # ---- Text Model (9B params) ----
   vocab_size: 32000
   block_size: 4096
-  n_layer: 24
-  n_head: 16
-  n_embd: 1024
+  n_layer: 48
+  n_head: 32
+  n_embd: 4096
   dropout: 0.0
   ffn_mult: 4.0
   multiple_of: 256
   tie_weights: true
+  use_gradient_checkpointing: true
+
+  # ---- Vision Model ----
+  img_size: 336
+  patch_size: 14
+  vision_embed_dim: 1024
+  vision_n_layers: 24
+  vision_n_heads: 16
 
   # ---- Generation ----
   max_new_tokens: 2048
@@ -34,44 +43,35 @@ llm:
   top_k: 50
   repetition_penalty: 1.1
   context_window: 4096
-  batch_size: 4
+  batch_size: 1
 
-  # ---- Fine-tuning / RL (pretrained mode only) ----
-  lora:
-    r: 16
-    lora_alpha: 32
-    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
-    lora_dropout: 0.05
-    bias: "none"
-    task_type: "CAUSAL_LM"
-
-  # ---- Training Hyperparameters ----
+  # ---- Training (A40-optimized) ----
   training:
     learning_rate: 1.0e-4
-    per_device_train_batch_size: 4
-    gradient_accumulation_steps: 4
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 16
     num_train_epochs: 1
-    max_steps: 200
-    warmup_steps: 20
+    max_steps: 500
+    warmup_steps: 50
     logging_steps: 5
-    save_steps: 50
+    save_steps: 100
     output_dir: "./models/checkpoints"
 
 # Self-Learning Loop
 learning:
   max_attempts_per_task: 5
-  reward_threshold: 0.8  # min reward to consider "learned"
+  reward_threshold: 0.8
   curriculum_enabled: true
   self_critique_enabled: true
   imitation_learning_enabled: true
-  error_analysis_depth: "deep"  # shallow | medium | deep
-  experience_buffer_size: 10000
-  training_frequency: 10  # train after N new experiences
-  explore_vs_exploit: 0.3  # epsilon for exploration
+  error_analysis_depth: "deep"
+  experience_buffer_size: 100000
+  training_frequency: 5
+  explore_vs_exploit: 0.3
 
 # Memory / Vector Store
 memory:
-  backend: "chroma"  # chroma | faiss
+  backend: "chroma"
   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
   collection_name: "assbrain_memory"
   similarity_threshold: 0.75
@@ -79,11 +79,11 @@ memory:
 
 # Evaluation & Sandbox
 evaluation:
-  sandbox_type: "subprocess"  # subprocess | docker
-  timeout_seconds: 60
-  max_memory_mb: 512
+  sandbox_type: "subprocess"
+  timeout_seconds: 120
+  max_memory_mb: 4096
   allow_network: false
-  allowed_imports: ["numpy", "pandas", "torch", "sklearn", "matplotlib", "seaborn", "transformers", "datasets", "fastapi", "pydantic"]
+  allowed_imports: ["numpy", "pandas", "torch", "sklearn", "matplotlib", "seaborn", "transformers", "datasets", "fastapi", "pydantic", "PIL"]
   blocked_imports: ["os.system", "subprocess.call", "eval", "exec", "compile", "open", "importlib"]
   auto_install_deps: true
 
@@ -97,7 +97,7 @@ browser:
 
 # LSP Integration
 lsp:
-  python_server: "pylsp"  # pylsp | jedi-language-server
+  python_server: "pylsp"
   typescript_server: "typescript-language-server"
   startup_timeout: 10
   diagnostics_enabled: true
@@ -105,10 +105,6 @@ lsp:
 # MCP (Model Context Protocol)
 mcp:
   servers: []
-  # Example:
-  # - name: "filesystem"
-  #   command: "npx"
-  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "./projects"]
 
 # Code Generation
 generation:

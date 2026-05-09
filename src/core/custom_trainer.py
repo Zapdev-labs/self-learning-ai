@@ -1,4 +1,4 @@
-"""Training loop for the custom scratch transformer."""
+"""Training loop for the custom 9B multimodal transformer."""
 
 import logging
 import math
@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from .custom_transformer import AssBrainTransformer, ModelConfig
+from .multimodal_model import AssBrainMultimodal
 from .tokenizer_trainer import CodeTokenizer
 
 logger = logging.getLogger(__name__)
@@ -43,13 +43,13 @@ class ExperienceDataset(Dataset):
             chosen = exp.get("chosen", "")
             text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{chosen}<|im_end|>"
             ids = tokenizer.encode(text)
-            # Pad or chunk
             for i in range(0, max(1, len(ids) - block_size), block_size // 2):
                 chunk = ids[i : i + block_size + 1]
                 if len(chunk) < 2:
                     continue
-                x = chunk[:-1] + [tokenizer.pad_token_id] * (block_size - len(chunk) + 1)
-                y = chunk[1:] + [-100] * (block_size - len(chunk) + 1)
+                pad_len = block_size - len(chunk) + 1
+                x = chunk[:-1] + [tokenizer.pad_token_id] * pad_len
+                y = chunk[1:] + [-100] * pad_len
                 self.samples.append((torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)))
 
     def __len__(self):
@@ -60,16 +60,16 @@ class ExperienceDataset(Dataset):
 
 
 class CustomTrainer:
-    """Simplified trainer for the custom transformer."""
+    """Simplified trainer for the 9B multimodal transformer."""
 
     def __init__(
         self,
-        model: AssBrainTransformer,
+        model: AssBrainMultimodal,
         tokenizer: CodeTokenizer,
         device: str,
         learning_rate: float = 1e-4,
-        batch_size: int = 4,
-        grad_accum_steps: int = 4,
+        batch_size: int = 1,
+        grad_accum_steps: int = 8,
         max_steps: int = 1000,
         warmup_steps: int = 100,
         weight_decay: float = 0.1,
@@ -88,20 +88,36 @@ class CustomTrainer:
         # Compile for speed (PyTorch 2.0+)
         if compile_model and hasattr(torch, "compile"):
             try:
-                self.model = torch.compile(self.model)
-                logger.info("Model compiled with torch.compile()")
+                # Use reduce-overhead for large models
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                logger.info("Model compiled with torch.compile(mode='reduce-overhead')")
             except Exception as e:
                 logger.warning(f"torch.compile() failed: {e}")
 
+        # Enable gradient checkpointing if available
+        if hasattr(self.model, "config") and getattr(self.model.config, "use_gradient_checkpointing", False):
+            logger.info("Gradient checkpointing enabled in model config")
+
         self.scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
 
-        # AdamW with cosine decay
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=learning_rate,
-            betas=(0.9, 0.95),
-            weight_decay=weight_decay,
-        )
+        # AdamW with cosine decay — 8-bit for 9B model on A40
+        try:
+            import bitsandbytes as bnb
+            self.optimizer = bnb.optim.AdamW8bit(
+                self.model.parameters(),
+                lr=learning_rate,
+                betas=(0.9, 0.95),
+                weight_decay=weight_decay,
+            )
+            logger.info("Using 8-bit AdamW optimizer")
+        except Exception:
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=learning_rate,
+                betas=(0.9, 0.95),
+                weight_decay=weight_decay,
+            )
+            logger.info("Using standard AdamW optimizer")
 
     def _get_lr(self, step: int, base_lr: float) -> float:
         if step < self.warmup_steps:
@@ -117,15 +133,6 @@ class CustomTrainer:
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
         self._train_loop(loader, save_dir, label="pretrain")
 
-    def train_on_experiences(self, experiences: List[Dict[str, str]], save_dir: str):
-        """Train on self-learning experiences."""
-        dataset = ExperienceDataset(experiences, self.tokenizer, self.model.config.block_size)
-        if len(dataset) == 0:
-            logger.warning("No training samples from experiences")
-            return
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
-        self._train_loop(loader, save_dir, label="experience")
-
     def pretrain_on_texts(self, texts: List[str], save_dir: str):
         """Pre-train on raw text strings (e.g., from HF datasets)."""
         all_ids = []
@@ -138,6 +145,15 @@ class CustomTrainer:
         dataset = TokenDataset(all_ids, self.model.config.block_size)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
         self._train_loop(loader, save_dir, label="pretrain")
+
+    def train_on_experiences(self, experiences: List[Dict[str, str]], save_dir: str):
+        """Train on self-learning experiences."""
+        dataset = ExperienceDataset(experiences, self.tokenizer, self.model.config.block_size)
+        if len(dataset) == 0:
+            logger.warning("No training samples from experiences")
+            return
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
+        self._train_loop(loader, save_dir, label="experience")
 
     def _train_loop(self, loader: DataLoader, save_dir: str, label: str = "train"):
         self.model.train()
@@ -160,14 +176,19 @@ class CustomTrainer:
                     param_group["lr"] = lr
 
                 use_amp = self.scaler is not None
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    outputs = self.model(input_ids=x, labels=y)
-                    loss = outputs["loss"] / self.grad_accum_steps
+                try:
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        outputs = self.model(input_ids=x, labels=y)
+                        loss = outputs["loss"] / self.grad_accum_steps
 
-                if use_amp:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                    if use_amp:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+                except torch.cuda.OutOfMemoryError:
+                    logger.error("CUDA OOM during forward/backward. Try reducing batch_size or block_size.")
+                    torch.cuda.empty_cache()
+                    continue
 
                 running_loss += loss.item() * self.grad_accum_steps
 
@@ -187,7 +208,10 @@ class CustomTrainer:
                     if step % 10 == 0:
                         dt = time.time() - t0
                         loss_avg = running_loss / 10
-                        mfu = self.model.estimate_mfu(self.grad_accum_steps, dt / 10) if hasattr(self.model, "estimate_mfu") else 0
+                        try:
+                            mfu = self.model.estimate_mfu(self.grad_accum_steps, dt / 10)
+                        except Exception:
+                            mfu = 0
                         logger.info(
                             f"{label} | step {step}/{self.max_steps} | loss {loss_avg:.4f} | lr {lr:.2e} | mfu {mfu*100:.1f}%"
                         )
@@ -214,6 +238,8 @@ class CustomTrainer:
                     "n_layer": self.model.config.n_layer,
                     "n_head": self.model.config.n_head,
                     "n_embd": self.model.config.n_embd,
+                    "img_size": self.model.config.img_size,
+                    "patch_size": self.model.config.patch_size,
                 },
             },
             path,
@@ -266,10 +292,7 @@ def load_hf_code_datasets(tokenizer: CodeTokenizer, max_samples: int = 5000) -> 
 
 def seed_corpus_for_tokenizer(save_path: str, min_size_mb: int = 10) -> List[str]:
     """Generate a seed corpus for tokenizer training from local Python files."""
-    import tempfile
-
     files = []
-    # Search repo itself for code
     repo_root = Path(__file__).parent.parent.parent
     for ext in [".py", ".yaml", ".json", ".md"]:
         for p in repo_root.rglob(f"*{ext}"):
@@ -277,15 +300,9 @@ def seed_corpus_for_tokenizer(save_path: str, min_size_mb: int = 10) -> List[str
                 continue
             files.append(str(p))
 
-    # Also create synthetic code samples
     synthetic_dir = Path(save_path) / "synthetic_corpus"
     synthetic_dir.mkdir(parents=True, exist_ok=True)
 
-    python_snippets = [
-        # ... hundreds of diverse Python patterns
-    ]
-
-    # Write a large synthetic corpus
     corpus_file = synthetic_dir / "corpus.txt"
     with open(corpus_file, "w") as f:
         for _ in range(5000):

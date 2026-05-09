@@ -157,8 +157,13 @@ class AssBrainOrchestrator:
             self.gpu_monitor.print_summary()
         return results
 
-    async def generate_for_task(self, description: str, task_type: str = "code_generation") -> Dict[str, Any]:
-        """One-shot generation for a user-provided task."""
+    async def generate_for_task(
+        self,
+        description: str,
+        task_type: str = "code_generation",
+        images: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """One-shot generation for a user-provided task. Supports images."""
         from .core.types import TaskType, TaskDifficulty
         task = Task(
             id="user_task",
@@ -167,7 +172,21 @@ class AssBrainOrchestrator:
             difficulty=TaskDifficulty.INTERMEDIATE,
             source="user",
         )
-        sol = await self.generator.generate(task, attempt=1)
+        # If images provided, inject them into the generator context
+        if images and self.llm.mode == "scratch":
+            # For now, images are passed via the LLM engine directly in generate()
+            sol = await self.generator.generate(task, attempt=1)
+            # Re-generate with image context
+            raw = self.llm.generate(
+                description,
+                images=images,
+                system_prompt="You are an expert software engineer. Write clean, correct code.",
+            )
+            from .core.types import SolutionStatus
+            sol.code = raw
+            sol.language = "python" if "import" in raw else "typescript"
+        else:
+            sol = await self.generator.generate(task, attempt=1)
         result = await self.evaluator.evaluate(sol, task)
         return {
             "code": sol.code,
@@ -193,9 +212,15 @@ class AssBrainOrchestrator:
         table.add_column("Value", style="green")
         table.add_row("State", stats["state"])
         table.add_row("Episodes", str(stats["episodes"]))
-        table.add_row("Model", stats["model"]["model_id"])
-        table.add_row("Device", stats["model"]["device"])
-        table.add_row("LoRA Active", str(stats["model"]["lora_active"]))
+        model_stats = stats["model"]
+        if "params_B" in model_stats:
+            table.add_row("Model", f"Custom {model_stats['params_B']}B multimodal")
+            table.add_row("Vision", f"{model_stats.get('img_size', 336)}px ViT")
+            table.add_row("Tools", str(model_stats.get("use_tools", False)))
+        else:
+            table.add_row("Model", model_stats["model_id"])
+        table.add_row("Device", model_stats["device"])
+        table.add_row("LoRA Active", str(model_stats["lora_active"]))
         table.add_row("Experiences", str(stats["memory"]["total_experiences"]))
         table.add_row("Avg Reward", str(stats["memory"]["avg_reward"]))
         table.add_row("Curriculum", f"{stats['curriculum']['completed']}/{stats['curriculum']['total_steps']}")

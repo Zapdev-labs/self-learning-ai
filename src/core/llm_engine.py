@@ -2,11 +2,12 @@
 
 Supports two modes:
   - "pretrained": Load a model from HuggingFace Hub (original behavior)
-  - "scratch": Train a custom transformer from scratch (new default for ASSBRAIN)
+  - "scratch": Train a custom 9B multimodal transformer from scratch (new default)
 """
 
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -23,12 +24,14 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
 from datasets import Dataset as HFDataset
+from PIL import Image
 import threading
 
 from .config import Config
-from .custom_transformer import AssBrainTransformer, ModelConfig
-from .custom_trainer import CustomTrainer, seed_corpus_for_tokenizer
-from .tokenizer_trainer import CodeTokenizer, collect_code_files
+from .custom_trainer import CustomTrainer, load_hf_code_datasets, seed_corpus_for_tokenizer
+from .multimodal_model import AssBrainMultimodal, MultimodalConfig
+from .tokenizer_trainer import CodeTokenizer
+from .tool_executor import ToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ class LLMEngine:
     def __init__(self, config: Config):
         self.cfg = config.llm
         self.device = self._resolve_device(self.cfg.get("device", "auto"))
-        self.mode = self.cfg.get("mode", "pretrained")  # "pretrained" | "scratch"
+        self.mode = self.cfg.get("mode", "pretrained")
         self.model_id = self.cfg.get("model_id", "microsoft/DialoGPT-medium")
         self.context_window = self.cfg.get("context_window", 4096)
         self.max_new_tokens = self.cfg.get("max_new_tokens", 2048)
@@ -48,27 +51,23 @@ class LLMEngine:
         self.top_k = self.cfg.get("top_k", 50)
         self.repetition_penalty = self.cfg.get("repetition_penalty", 1.1)
         self.token = self.cfg.get("huggingface_token") or os.getenv("HF_TOKEN")
+        self.use_tools = self.cfg.get("use_tools", True)
 
-        # Model state
         self.model: Optional[Any] = None
-        self.tokenizer: Optional[Any] = None          # HF tokenizer (pretrained mode)
-        self.custom_tokenizer: Optional[CodeTokenizer] = None  # Custom tokenizer (scratch mode)
+        self.tokenizer: Optional[Any] = None
+        self.custom_tokenizer: Optional[CodeTokenizer] = None
         self.base_model: Optional[Any] = None
         self._is_loaded = False
         self._lora_active = False
         self._custom_trainer: Optional[CustomTrainer] = None
+        self.tool_executor = ToolExecutor()
 
-        # Paths
         self.models_dir = Path(config.get("app.models_dir", "./models"))
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir = self.models_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         self.load_model()
-
-    # ------------------------------------------------------------------
-    # Device & Quantization
-    # ------------------------------------------------------------------
 
     def _resolve_device(self, device_str: str) -> str:
         if device_str == "auto":
@@ -93,10 +92,6 @@ class LLMEngine:
             return BitsAndBytesConfig(load_in_8bit=True)
         return None
 
-    # ------------------------------------------------------------------
-    # Model Loading
-    # ------------------------------------------------------------------
-
     def load_model(self) -> None:
         if self.mode == "scratch":
             self._load_scratch_model()
@@ -104,10 +99,8 @@ class LLMEngine:
             self._load_pretrained_model()
 
     def _load_scratch_model(self):
-        """Initialize or load a custom transformer from scratch."""
-        logger.info("Initializing custom ASSBRAIN transformer from scratch...")
+        logger.info("Initializing 9B multimodal ASSBRAIN from scratch...")
 
-        # Load or train custom tokenizer
         tok_path = self.models_dir / "custom_tokenizer" / "tokenizer.json"
         self.custom_tokenizer = CodeTokenizer(vocab_size=self.cfg.get("vocab_size", 32000))
 
@@ -127,29 +120,45 @@ class LLMEngine:
         vocab_size = self.custom_tokenizer.vocab_size
         logger.info(f"Tokenizer vocab size: {vocab_size}")
 
-        # Build model config from YAML
-        mcfg = ModelConfig(
+        mcfg = MultimodalConfig(
             vocab_size=vocab_size,
-            block_size=self.cfg.get("block_size", 4096),
-            n_layer=self.cfg.get("n_layer", 24),
-            n_head=self.cfg.get("n_head", 16),
-            n_embd=self.cfg.get("n_embd", 1024),
+            block_size=self.cfg.get("block_size", 8192),
+            n_layer=self.cfg.get("n_layer", 48),
+            n_head=self.cfg.get("n_head", 32),
+            n_embd=self.cfg.get("n_embd", 4096),
             dropout=self.cfg.get("dropout", 0.0),
             ffn_mult=self.cfg.get("ffn_mult", 4.0),
             multiple_of=self.cfg.get("multiple_of", 256),
             tie_weights=self.cfg.get("tie_weights", True),
+            use_gradient_checkpointing=self.cfg.get("use_gradient_checkpointing", True),
+            img_size=self.cfg.get("img_size", 336),
+            patch_size=self.cfg.get("patch_size", 14),
+            vision_embed_dim=self.cfg.get("vision_embed_dim", 1024),
+            vision_n_layers=self.cfg.get("vision_n_layers", 24),
+            vision_n_heads=self.cfg.get("vision_n_heads", 16),
+            pad_token_id=self.custom_tokenizer.pad_token_id,
+            eos_token_id=self.custom_tokenizer.eos_token_id,
+            image_start_token_id=self.custom_tokenizer.image_start_token_id,
+            image_end_token_id=self.custom_tokenizer.image_end_token_id,
+            tool_call_begin_id=self.custom_tokenizer.tool_call_begin_id,
+            tool_call_end_id=self.custom_tokenizer.tool_call_end_id,
+            tool_result_begin_id=self.custom_tokenizer.tool_result_begin_id,
+            tool_result_end_id=self.custom_tokenizer.tool_result_end_id,
         )
 
         logger.info(
             f"Model config: {mcfg.n_layer} layers, {mcfg.n_head} heads, "
-            f"{mcfg.n_embd} dim, ~{mcfg.estimate_params() / 1e6:.0f}M params"
+            f"{mcfg.n_embd} dim, ~{mcfg.estimate_params() / 1e9:.1f}B params"
         )
 
-        self.model = AssBrainTransformer(mcfg).to(self.device)
+        self.model = AssBrainMultimodal(mcfg).to(self.device)
         param_count = self.model.get_num_params()
-        logger.info(f"Model initialized with {param_count / 1e6:.1f}M parameters on {self.device}")
+        logger.info(f"Model initialized with {param_count / 1e9:.1f}B parameters on {self.device}")
 
-        # Try to load checkpoint
+        if torch.cuda.is_available() and hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+            logger.info("Set float32 matmul precision to high (bf16)")
+
         latest_ckpt = self._find_latest_checkpoint()
         if latest_ckpt:
             logger.info(f"Resuming from checkpoint: {latest_ckpt}")
@@ -162,7 +171,6 @@ class LLMEngine:
         self._is_loaded = True
 
     def _load_pretrained_model(self):
-        """Load a pre-trained model from HuggingFace (original behavior)."""
         logger.info(f"Loading model {self.model_id} on {self.device}...")
         kwargs = {
             "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
@@ -193,7 +201,6 @@ class LLMEngine:
         ckpts = sorted(self.checkpoint_dir.glob("checkpoint-*.pt"), key=lambda p: p.stat().st_mtime)
         if not ckpts:
             return None
-        # Prefer final, then latest by mtime
         for c in ckpts:
             if "final" in c.name:
                 return str(c)
@@ -206,42 +213,70 @@ class LLMEngine:
     def generate(
         self,
         prompt: str,
+        images: Optional[List[Union[str, Image.Image]]] = None,
         system_prompt: Optional[str] = None,
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         stream: bool = False,
+        use_tools: Optional[bool] = None,
     ) -> Union[str, Iterator[str]]:
         if not self._is_loaded:
             raise RuntimeError("Model not loaded")
 
         if self.mode == "scratch":
-            return self._generate_scratch(prompt, system_prompt, max_new_tokens, temperature, top_p)
+            return self._generate_scratch(prompt, images, system_prompt, max_new_tokens, temperature, top_p, use_tools)
         else:
             return self._generate_pretrained(prompt, system_prompt, max_new_tokens, temperature, top_p, stream)
+
+    def _prepare_images(self, images: Optional[List[Union[str, Image.Image]]]) -> Optional[List[Image.Image]]:
+        if images is None:
+            return None
+        pil_images = []
+        for img in images:
+            if isinstance(img, str):
+                pil_images.append(Image.open(img).convert("RGB"))
+            else:
+                pil_images.append(img.convert("RGB"))
+        return pil_images
 
     def _generate_scratch(
         self,
         prompt: str,
+        images: Optional[List[Union[str, Image.Image]]] = None,
         system_prompt: Optional[str] = None,
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        use_tools: Optional[bool] = None,
     ) -> str:
         assert self.custom_tokenizer is not None and self.model is not None
+        use_tools = use_tools if use_tools is not None else self.use_tools
+        pil_images = self._prepare_images(images)
 
-        # Build chat prompt
         parts = []
         if system_prompt:
             parts.append(f"<|im_start|>system\n{system_prompt}<|im_end|>")
-        parts.append(f"<|im_start|>user\n{prompt}<|im_end|>")
+
+        # Add tool descriptions if tool use is enabled
+        if use_tools:
+            tools_desc = self.tool_executor.get_tool_descriptions()
+            parts.append(f"<|im_start|>system\nYou have access to the following tools:\n{tools_desc}\n<|im_end|>")
+
+        if pil_images:
+            parts.append(f"<|im_start|>user\n<|image_start|>{'<'*self.model.config.num_image_tokens}<|image_end|>\n{prompt}<|im_end|>")
+        else:
+            parts.append(f"<|im_start|>user\n{prompt}<|im_end|>")
+
         parts.append("<|im_start|>assistant\n")
         full_prompt = "\n".join(parts)
 
         input_ids = torch.tensor([self.custom_tokenizer.encode(full_prompt)], dtype=torch.long, device=self.device)
 
+        # Generate
         output_ids = self.model.generate(
             input_ids,
+            images=pil_images,
             max_new_tokens=max_new_tokens or self.max_new_tokens,
             temperature=temperature or self.temperature,
             top_p=top_p or self.top_p,
@@ -251,12 +286,33 @@ class LLMEngine:
             pad_token_id=self.custom_tokenizer.pad_token_id,
         )
 
-        # Decode only the new tokens
         new_ids = output_ids[0, input_ids.size(1):].tolist()
         text = self.custom_tokenizer.decode(new_ids)
-        # Strip any remaining special tokens
+
+        # Strip special tokens
         for tok in ["<|im_start|>", "<|im_end|>", "<|user|>", "<|assistant|>", "<|system|>"]:
             text = text.replace(tok, "").strip()
+
+        # Handle tool calls
+        if use_tools and "<|tool_call_begin|>" in text:
+            text = self._handle_tool_calls(text)
+
+        return text
+
+    def _handle_tool_calls(self, text: str) -> str:
+        """Parse tool calls from generated text, execute them, and append results."""
+        calls = self.model.parse_tool_calls(text)
+        if not calls:
+            return text
+
+        results = self.tool_executor.execute_batch(calls)
+        result_texts = []
+        for call, result in zip(calls, results):
+            tool_name = call.get("name", call.get("tool", "unknown"))
+            result_texts.append(self.model.format_tool_result(tool_name, result))
+
+        # Append results and continue generation if needed
+        text = text + "\n" + "\n".join(result_texts)
         return text
 
     def _generate_pretrained(
@@ -302,8 +358,7 @@ class LLMEngine:
             return f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:"
         return f"User: {user_prompt}\n\nAssistant:"
 
-    def chat(self, messages: List[Dict[str, str]], **gen_kwargs) -> str:
-        """OpenAI-style chat completion."""
+    def chat(self, messages: List[Dict[str, str]], images: Optional[List[Union[str, Image.Image]]] = None, **gen_kwargs) -> str:
         if self.mode == "scratch":
             parts = []
             for m in messages:
@@ -312,7 +367,7 @@ class LLMEngine:
                 parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
             parts.append("<|im_start|>assistant\n")
             prompt = "\n".join(parts)
-            return self._generate_scratch(prompt, None, **gen_kwargs)
+            return self._generate_scratch(prompt, images, None, **gen_kwargs)
         else:
             prompt_parts = []
             for m in messages:
@@ -327,9 +382,8 @@ class LLMEngine:
     # ------------------------------------------------------------------
 
     def apply_lora(self) -> None:
-        """Apply LoRA adapters (pretrained mode only)."""
         if self.mode == "scratch":
-            logger.info("LoRA not needed in scratch mode — training full model")
+            logger.info("LoRA not needed in scratch mode")
             return
         if not self._is_loaded:
             raise RuntimeError("Model not loaded")
@@ -353,7 +407,6 @@ class LLMEngine:
         experiences: List[Dict[str, str]],
         output_dir: Optional[str] = None,
     ) -> str:
-        """Train on successful experiences."""
         if self.mode == "scratch":
             return self._train_scratch(experiences, output_dir)
         else:
@@ -371,8 +424,8 @@ class LLMEngine:
                 tokenizer=self.custom_tokenizer,
                 device=self.device,
                 learning_rate=tcfg.get("learning_rate", 1e-4),
-                batch_size=tcfg.get("per_device_train_batch_size", 4),
-                grad_accum_steps=tcfg.get("gradient_accumulation_steps", 4),
+                batch_size=tcfg.get("per_device_train_batch_size", 1),
+                grad_accum_steps=tcfg.get("gradient_accumulation_steps", 8),
                 max_steps=tcfg.get("max_steps", 200),
                 warmup_steps=tcfg.get("warmup_steps", 20),
                 compile_model=self.cfg.get("compile", True),
@@ -382,7 +435,6 @@ class LLMEngine:
         return out
 
     def _train_pretrained(self, experiences: List[Dict[str, str]], output_dir: Optional[str] = None) -> str:
-        """Original HF Trainer-based fine-tuning."""
         if not self._lora_active:
             self.apply_lora()
         assert self.model is not None and self.tokenizer is not None
@@ -441,7 +493,6 @@ class LLMEngine:
         return adapter_path
 
     def save_full_model(self, path: str) -> None:
-        """Save complete model + tokenizer."""
         if self.mode == "scratch":
             assert self.model is not None and self.custom_tokenizer is not None
             out = Path(path)
@@ -459,6 +510,11 @@ class LLMEngine:
                         "ffn_mult": self.model.config.ffn_mult,
                         "multiple_of": self.model.config.multiple_of,
                         "tie_weights": self.model.config.tie_weights,
+                        "img_size": self.model.config.img_size,
+                        "patch_size": self.model.config.patch_size,
+                        "vision_embed_dim": self.model.config.vision_embed_dim,
+                        "vision_n_layers": self.model.config.vision_n_layers,
+                        "vision_n_heads": self.model.config.vision_n_heads,
                     },
                 },
                 out / "model.pt",
@@ -476,7 +532,6 @@ class LLMEngine:
             logger.info(f"Full pretrained model saved to {out}")
 
     def merge_and_unload(self) -> None:
-        """Merge LoRA weights back into base model."""
         if self.mode == "scratch":
             return
         if self._lora_active and isinstance(self.model, PeftModel):
@@ -485,7 +540,6 @@ class LLMEngine:
             logger.info("LoRA merged into base model.")
 
     def load_adapter(self, adapter_path: str) -> None:
-        """Load a previously saved LoRA adapter."""
         if self.mode == "scratch":
             logger.warning("Adapters not supported in scratch mode")
             return
@@ -494,10 +548,6 @@ class LLMEngine:
         self.model = PeftModel.from_pretrained(self.model, adapter_path)
         self._lora_active = True
         logger.info(f"Loaded adapter from {adapter_path}")
-
-    # ------------------------------------------------------------------
-    # Properties & Stats
-    # ------------------------------------------------------------------
 
     @property
     def is_ready(self) -> bool:
@@ -510,10 +560,13 @@ class LLMEngine:
             "mode": self.mode,
             "lora_active": self._lora_active,
             "context_window": self.context_window,
+            "use_tools": self.use_tools,
         }
         if self.mode == "scratch" and self.model is not None:
-            stats["params_M"] = round(self.model.get_num_params() / 1e6, 1)
+            stats["params_B"] = round(self.model.get_num_params() / 1e9, 2)
             stats["dtype"] = str(next(self.model.parameters()).dtype)
+            stats["img_size"] = self.model.config.img_size
+            stats["vision_layers"] = self.model.config.vision_n_layers
         elif self.model is not None:
             stats["dtype"] = str(self.model.dtype)
         return stats
